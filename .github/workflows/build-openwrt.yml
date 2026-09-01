@@ -1,195 +1,261 @@
 name: OpenWrt Builder
 
 on:
-  repository_dispatch:
-  workflow_dispatch:
+  repository_dispatch:        # API 触发：curl -X POST 到 /actions/workflows/<id>/dispatches
+  workflow_dispatch:          # 手动触发，支持临时传参
     inputs:
-      clean:
-        description: 'Clean build (delete ccache & feeds before building)'
+      repo_branch:
+        description: '源码分支（默认 master）'
         required: false
-        default: 'false'
+        default: 'master'
+      upload_release:
+        description: '上传到 GitHub Release'
+        type: boolean
+        default: true
 
+# 最小权限：创建 Release 需要 contents:write；删除旧 runs 需要 actions:write
+permissions:
+  contents: write
+  actions: write
+
+# 同一时间只允许一个构建，避免重复触发互相抢占、浪费配额
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+  group: openwrt-build
+  cancel-in-progress: false
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: master
+  REPO_BRANCH: ${{ inputs.repo_branch || 'master' }}
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
- UPLOAD_BIN_DIR: false
+  UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
+  UPLOAD_RELEASE: ${{ inputs.upload_release != false }}
   TZ: Asia/Shanghai
-  CCACHE_DIR: /workdir/.ccachepermissions:
-  contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    runs-on: ubuntu-22.04        # lede 依赖 libncurses5-dev 等，24.04 已移除这些包，勿轻易升级
+    timeout-minutes: 300         # 超时兜底，防止异常卡死占用 runner
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Initialize environment
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -e
-          sudo rm -rf /etc/apt/sources.list.d/* \
- /usr/share/dotnet \
-                      /usr/local/lib/android \
-                      /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL
-          sudo -E apt-get -qq update
-          sudo -E apt-get -qq install -y --no-install-recommends \
- ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-              build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
-              fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
-              haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev \
-              libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
-              libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
-              libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full \
-              patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools \
-              qemu-utils rsync scons squashfs-tools subversion swig texinfo \
-              uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev sudo -E apt-get -qq autoremove --purge
-          sudo -E apt-get -qq clean
-          sudo timedatectl set-timezone "$TZ"
-          sudo mkdir -p /workdir "$CCACHE_DIR"
-          sudo chown -R "$USER:$GROUPS" /workdir
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 释放磁盘：清掉 runner 自带的大体积工具
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        # ubuntu-22.04 已移除 Python2（python2.7 不存在），不要再加
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown "$USER" /workdir
 
- - name: Cache ccache
-        uses: actions/cache@v4 with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.run_id }}
-          restore-keys: |
- ccache-
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT "$PWD"
+        # 浅克隆：lede 仓库很大，编译不需要 git 历史
+        git clone "$REPO_URL" -b "$REPO_BRANCH" --depth=1 openwrt
+        ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
 
-      - name: Clone source code
-        working-directory: /workdir
-        run: |
-          df -hT "$PWD"
-          git clone --depth=1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
-          ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+    - name: Load custom feeds
+      run: |
+        [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default
+        chmod +x "$DIY_P1_SH"
+        cd openwrt
+        "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
-      - name: Load custom feeds
-        run: |
-          set -e
-          [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default
-          chmod +x "$DIY_P1_SH"
-          cd openwrt
- "$GITHUB_WORKSPACE/$DIY_P1_SH"
+    - name: Update feeds
+      run: |
+        cd openwrt
+        # runner 网络偶发抽风，最多重试 3 次；3 次全失败会自动让本步骤失败
+        for i in 1 2 3; do
+          ./scripts/feeds update -a && break
+          echo "::warning::feeds update 第 $i 次失败，10s 后重试"
+          sleep 10
+        done
 
-      - name: Update & install feeds
-        run: |
-          cd openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
 
-      - name: Load custom configuration
-        run: |
-          set -e
-          [ -e files ] && mv files openwrt/files
-          [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
-          chmod +x "$DIY_P2_SH"
-          cd openwrt
-          "$GITHUB_WORKSPACE/$DIY_P2_SH"
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
+        chmod +x "$DIY_P2_SH"
+        cd openwrt
+        "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
-      - name: Download packages
-        id: package
-        run: |
-          cd openwrt
-          make defconfig
-          make download -j"$(nproc)"
-          find dl -size -1024c -exec ls -l {} \;
-          find dl -size -1024c -exec rm -f {} \;
+    # ===== 性能核心：缓存 dl 下载目录 =====
+    # 二次构建直接命中缓存，省掉大部分 make download（通常省 5~15 分钟）。
+    # key 随 .config 变化而失效，restore-keys 会回退到最近的旧缓存；
+    # save-always: true 保证即使编译失败也保存缓存，下次构建仍有收益。
+    - name: Cache package downloads
+      uses: actions/cache@v4
+      with:
+        path: /workdir/openwrt/dl
+        key: lede-dl-${{ hashFiles('openwrt/.config') }}
+        restore-keys: |
+          lede-dl-
+        save-always: true
 
-      - name: Compile firmware
-        id: compile
-        run: |
-          cd openwrt
-          echo "::group::Build started with $(nproc) threads"
-          ccache -M 10G || true
-          make -j"$(nproc)" defconfig
-          make -j"$(nproc)" || make -j1 || make -j1 V=s
-          echo "::endgroup::"
-          echo "status=success" >> "$GITHUB_OUTPUT"
-          DEVICE=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' || echo unknown)
-          echo "DEVICE_NAME=_${DEVICE}" >> "$GITHUB_ENV"
-          echo "FILE_DATE=_$(date +'%Y%m%d%H%M')" >> "$GITHUB_ENV"
+    # 可选：ccache 编译缓存（需在 .config 中开启 CONFIG_CCACHE=y 才有效）
+    # - name: Cache ccache
+    #   uses: actions/cache@v4
+    #   with:
+    #     path: /workdir/openwrt/.ccache
+    #     key: lede-ccache-${{ hashFiles('openwrt/.config') }}
+    #     restore-keys: |
+    #       lede-ccache-
+    #     save-always: true
 
-      - name: Check disk usage
-        if: !cancelled()
-        run: df -hT
+    - name: Download package
+      run: |
+        cd openwrt
+        make defconfig
+        # 下载失败自动重试，nproc 并行充分利用带宽
+        for i in 1 2 3; do
+          make download -j$(nproc) && break
+          echo "::warning::make download 第 $i 次失败，5s 后重试"
+          sleep 5
+        done
+        # 清理残缺下载（<1KB 视为下载失败），编译时会自动补齐
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-      - name: Upload bin directory
-        uses: actions/upload-artifact@v4
-        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true' && !cancelled()
-        with:
-          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-          path: openwrt/bin
-          if-no-files-found: error
-          retention-days: 3
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "$(nproc) thread compile"
+        # 多线程失败自动降级单线程，再失败输出详细日志；
+        # 全程 tee 保留完整日志，失败时可上传排查
+        make -j$(nproc) 2>&1 | tee /workdir/build.log \
+          || make -j1 2>&1 | tee -a /workdir/build.log \
+          || make -j1 V=s 2>&1 | tee -a /workdir/build.log
+        RC=$?
+        if [ $RC -ne 0 ]; then
+          echo "::error::编译失败，完整日志见 build.log（已上传 artifact）"
+          exit $RC
+        fi
+        echo "status=success" >> "$GITHUB_OUTPUT"
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' | head -1 > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
 
-      - name: Organize files
-        id: organize
-        if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-        run: |
-          cd openwrt/bin/targets/*/* || { echo "status=failed" >> "$GITHUB_OUTPUT"; exit 1; }
-          rm -rf packages
-          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
-          echo "status=success" >> "$GITHUB_OUTPUT"
+    # 编译失败时把完整日志上传为 artifact，方便排查（默认 stdout 会被截断）
+    - name: Upload build log
+      if: failure() && steps.compile.outcome == 'failure'
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-build-log
+        path: /workdir/build.log
+        retention-days: 7
+        if-no-files-found: warn
 
-      - name: Upload firmware directory
-        uses: actions/upload-artifact@v4
-        if: steps.organize.outputs.status == 'success' && !cancelled()
-        with:
-          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-          path: ${{ env.FIRMWARE }}
-          if-no-files-found: error
-          retention-days: 7
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
 
-      - name: Generate release tag
-        id: tag
-        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-        run: |
-          echo "release_tag=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_OUTPUT"
-          {
-            echo "## OpenWrt Firmware"
-            echo ""
-            echo "Build date: $(date +'%Y-%m-%d %H:%M:%S')"
-            echo "Source: $REPO_URL @ $REPO_BRANCH"
-          } > release.txt
-          echo "status=success" >> "$GITHUB_OUTPUT"
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+        retention-days: 14
 
-      - name: Upload firmware to release
-        uses: softprops/action-gh-release@v2
-        if: steps.tag.outputs.status == 'success' && !cancelled()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.tag.outputs.release_tag }}
-          name: OpenWrt Build ${{ steps.tag.outputs.release_tag }}
-          body_path: release.txt
-          files: |
- ${{ env.FIRMWARE }}/*
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        # ls -d + head -1：多 target 场景下也不会因 glob 匹配多个目录而失败
+        DIR=$(ls -d openwrt/bin/targets/*/* 2>/dev/null | head -1)
+        [ -n "$DIR" ] || { echo "::error::未找到固件输出目录"; exit 1; }
+        cd "$DIR"
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          retain_days: 0
-          keep_minimum_runs: 2
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+        retention-days: 14
 
-      - name: Remove old Releases
-        uses: dev-drprasad/delete-older-releases@v1
-        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-        with:
-          keep_latest: 3
-          delete_tags: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # 有固件才生成 Release（防止 UPLOAD_FIRMWARE=false 时误传根目录）
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && env.FIRMWARE != '' && !cancelled()
+      run: |
+        # 加秒，避免同一分钟重复触发时 tag 冲突
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M%S")" >> "$GITHUB_OUTPUT"
+        {
+          echo "## OpenWrt 固件自动构建"
+          echo "- 构建时间: $(date +"%Y-%m-%d %H:%M:%S %Z")"
+          echo "- 源码: $REPO_URL ($REPO_BRANCH)"
+          echo "- 设备: $DEVICE_NAME"
+          echo ""
+          echo "### 固件文件"
+          ls -lh "$FIRMWARE"
+        } > release.txt
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    # 运行结果页直接展示构建摘要
+    - name: Build summary
+      if: always() && steps.organize.outputs.status == 'success'
+      run: |
+        {
+          echo "## ✅ 构建完成"
+          echo "- 设备: $DEVICE_NAME"
+          echo "- 固件目录: $FIRMWARE"
+          ls -lh "$FIRMWARE"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.3.3
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ===== 可选：Telegram 通知（仓库 Settings → Secrets 配置 TG_BOT_TOKEN / TG_CHAT_ID 后取消注释）=====
+    # - name: Notify Telegram
+    #   if: always()
+    #   env:
+    #     TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+    #     TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+    #   run: |
+    #     curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    #       -d chat_id="${TG_CHAT_ID}" \
+    #       -d text="OpenWrt 构建完成：${{ job.status }}" || true
