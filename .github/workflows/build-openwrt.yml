@@ -29,8 +29,8 @@ env:
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
   UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
+  UPLOAD_FIRMWARE: ${{ github.event.inputs.upload_firmware || 'true' }}
+  UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
   TZ: Asia/Shanghai
 
 permissions:
@@ -45,7 +45,7 @@ jobs:
     steps:
       # ==================== 检出仓库 ====================
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       # ==================== 初始化环境 ====================
       - name: Initialization environment
@@ -55,7 +55,14 @@ jobs:
           set -e
 
           echo "::group::清理磁盘空间"
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf \
+            /etc/apt/sources.list.d/* \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/node_modules \
+            /usr/lib/jvm
           sudo docker image prune --all --force 2>/dev/null || true
           sudo -E apt-get -qq update
           echo "::endgroup::"
@@ -70,7 +77,7 @@ jobs:
             libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
             libpython3-dev libreadline-dev libssl-dev libtool lrzsz \
             mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf \
-            python2.7 python3 python3-pyelftools python3-setuptools \
+            python3 python3-pyelftools python3-setuptools \
             qemu-utils rsync scons squashfs-tools subversion swig \
             texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
           echo "::endgroup::"
@@ -193,26 +200,41 @@ jobs:
       - name: Compile firmware
         id: compile
         run: |
-          set -e
+          set -o pipefail
           cd openwrt
 
           NPROC=$(nproc)
           echo "使用 ${NPROC} 线程编译"
 
-          echo "::group::编译开始"
-          if make -j"$NPROC" 2>&1; then
-            echo "✅ 编译成功"
-          elif make -j1 2>&1; then
-            echo "✅ 单线程重试编译成功"
-          elif make -j1 V=s 2>&1; then
-            echo "✅ 详细模式编译成功"
+          BUILD_OK=0
+
+          echo "::group::多线程编译 (-j${NPROC})"
+          if make -j"$NPROC" 2>&1 | tee build.log; then
+            BUILD_OK=1
           else
-            echo "::error::编译失败"
-            exit 1
+            echo "::endgroup::"
+            echo "⚠️ 多线程编译失败，尝试单线程重试..."
+            echo "::group::单线程重试 (-j1)"
+            if make -j1 2>&1 | tee -a build.log; then
+              BUILD_OK=1
+            else
+              echo "::endgroup::"
+              echo "⚠️ 单线程失败，尝试详细模式..."
+              echo "::group::详细模式编译 (-j1 V=s)"
+              if make -j1 V=s 2>&1 | tee -a build.log; then
+                BUILD_OK=1
+              fi
+            fi
           fi
           echo "::endgroup::"
 
-          echo "status=success" >> "$GITHUB_OUTPUT"
+          if [ "$BUILD_OK" = "1" ]; then
+            echo "✅ 编译成功"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::编译失败，请查看上方日志或下载 build.log 排查"
+            exit 1
+          fi
 
           # 提取设备名
           grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
@@ -223,6 +245,16 @@ jobs:
           fi
 
           echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      # ==================== 上传编译日志（失败时） ====================
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_log${{ env.FILE_DATE }}
+          path: openwrt/build.log
+          retention-days: 7
+          if-no-files-found: ignore
 
       # ==================== 磁盘空间检查 ====================
       - name: Check space usage
@@ -239,7 +271,7 @@ jobs:
       # ==================== 上传完整 bin 目录 ====================
       - name: Upload bin directory
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
           path: openwrt/bin
@@ -272,8 +304,8 @@ jobs:
 
       # ==================== 上传固件 Artifact ====================
       - name: Upload firmware artifact
-        if: steps.organize.outputs.status == 'success'
-        uses: actions/upload-artifact@v5
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
           path: ${{ env.FIRMWARE }}
@@ -290,12 +322,14 @@ jobs:
           RELEASE_TAG="OpenWrt-$(date +%Y.%m.%d-%H%M)"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-          # 生成 Release 说明
+          DEVICE=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
+            | sed 's/.*DEVICE_\(.*\)=y/\1/' || echo 'Unknown')
+
           cat > release.txt <<EOF
           ## OpenWrt Lean 编译固件
 
           **编译时间:** $(date '+%Y-%m-%d %H:%M:%S %Z')
-          **设备:** $(grep '^CONFIG_TARGET.*DEVICE.*=y' openwrt/.config | sed 's/.*DEVICE_\(.*\)=y/\1/' || echo 'Unknown')
+          **设备:** ${DEVICE}
           **源码:** ${REPO_URL} @ ${REPO_BRANCH}
 
           ---
@@ -320,20 +354,31 @@ jobs:
       # ==================== 清理旧 Workflow 运行记录 ====================
       - name: Delete old workflow runs
         if: always()
-        uses: Mattraks/delete-workflow-runs@main
-        with:
-          retain_days: 7
-          keep_minimum_runs: 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 保留最近 5 次已完成的运行，删除其余
+          gh run list --status completed --limit 100 --json databaseId \
+            --jq '.[5:][] | .databaseId' \
+            | while read -r id; do
+                [ -z "$id" ] && continue
+                gh run delete "$id" || true
+              done
 
       # ==================== 清理旧 Releases ====================
       - name: Remove old releases
         if: env.UPLOAD_RELEASE == 'true' && always()
-        uses: dev-drprasad/delete-older-releases@v1.0
-        with:
-          keep_latest: 3
-          delete_tags: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 保留最新 3 个 Release，删除其余（保留 tag）
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:][] | .tagName' \
+            | while read -r tag; do
+                [ -z "$tag" ] && continue
+                echo "Deleting release: $tag"
+                gh release delete "$tag" --yes || true
+              done
 
       # ==================== 编译失败通知 ====================
       - name: Notification on failure
@@ -345,3 +390,4 @@ jobs:
           echo "::error::  1. 配置文件选择的目标设备有误"
           echo "::error::  2. 依赖包下载不完整"
           echo "::error::  3. 源码更新导致配置不兼容"
+          echo "::error::完整编译日志已上传为 Artifact（build_log）"
