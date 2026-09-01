@@ -1,8 +1,24 @@
 name: OpenWrt Builder
 
 on:
-  repository_dispatch:
   workflow_dispatch:
+    inputs:
+      upload_firmware:
+        description: 'Upload firmware artifacts'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      upload_release:
+        description: 'Upload to GitHub Release'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
@@ -15,134 +31,167 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+  CACHE_SIZE: 10G
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 720
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+      # ==================== 环境初始化 ====================
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
 
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+          echo "::group::清理磁盘空间"
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo -E apt-get -qq update
+          echo "::endgroup::"
 
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+          echo "::group::安装编译依赖"
+          sudo -E apt-get -qq install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache cmake cpio curl \
+            device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+            git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
+            libpython3-dev libreadline-dev libssl-dev libtool lrzsz \
+            mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf \
+            python2.7 python3 python3-pyelftools python3-setuptools \
+            qemu-utils rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          echo "::endgroup::"
 
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+          sudo -E apt-get -qq autoremove --purge -y
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown "$(whoami)":"$(id -gn)" /workdir
 
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
+      # ==================== 克隆源码 ====================
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          set -e
+          echo "::group::显示磁盘信息"
+          df -hT "$PWD"
+          echo "::endgroup::"
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
+          if [ -d openwrt/.git ]; then
+            echo "源码已存在，执行更新..."
+            cd openwrt
+            git fetch --all
+            git reset --hard origin/"$REPO_BRANCH"
+            git clean -fd
+          else
+            echo "开始克隆源码..."
+            git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+          fi
 
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+          ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
 
-    - name: Compile the firmware
-      id: compile
-      run: |
-        cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+      # ==================== 自定义 Feeds ====================
+      - name: Load custom feeds
+        run: |
+          set -e
+          if [ -f "$FEEDS_CONF" ]; then
+            cp -f "$FEEDS_CONF" openwrt/feeds.conf.default
+          fi
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+          if [ -f "$DIY_P1_SH" ]; then
+            chmod +x "$DIY_P1_SH"
+            cd openwrt
+            bash "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          else
+            echo "未找到 $DIY_P1_SH，跳过"
+          fi
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@v4
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+      # ==================== 更新 Feeds ====================
+      - name: Update & install feeds
+        run: |
+          set -e
+          cd openwrt
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+          echo "::group::更新 feeds"
+          ./scripts/feeds update -a
+          echo "::endgroup::"
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@v4
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+          echo "::group::安装 feeds"
+          ./scripts/feeds install -a
+          echo "::endgroup::"
 
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+      # ==================== 加载自定义配置 ====================
+      - name: Load custom configuration
+        run: |
+          set -e
+          if [ -d files ]; then
+            cp -rf files openwrt/files
+          fi
 
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@v2
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+          if [ -f "$CONFIG_FILE" ]; then
+            cp -f "$CONFIG_FILE" openwrt/.config
+          else
+            echo "⚠️ 未找到 $CONFIG_FILE"
+            exit 1
+          fi
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
+          if [ -f "$DIY_P2_SH" ]; then
+            chmod +x "$DIY_P2_SH"
+            cd openwrt
+            bash "$GITHUB_WORKSPACE/$DIY_P2_SH"
+          else
+            echo "未找到 $DIY_P2_SH，跳过"
+          fi
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.2.0
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # ==================== 下载软件包 ====================
+      - name: Download packages
+        run: |
+          set -e
+          cd openwrt
+
+          echo "::group::生成默认配置"
+          make defconfig
+          echo "::endgroup::"
+
+          echo "::group::下载软件包"
+          make download -j"$(nproc)"
+          echo "::endgroup::"
+
+          # 清理不完整下载
+          find dl -size -1024c -type f -delete 2>/dev/null || true
+
+      # ==================== 编译固件 ====================
+      - name: Compile firmware
+        id: compile
+        run: |
+          set -e
+          cd openwrt
+
+          NPROC=$(nproc)
+          echo "使用 ${NPROC} 线程编译"
+          echo "::group::编译开始"
+
+          if make -j"$NPROC" 2>&1; then
+            echo "✅ 编译成功"
+          elif make -j1 2>&1; then
+            echo "✅ 单线程重试编译成功"
+          elif make -j1 V=s 2>&1; then
+            echo "✅ 详细模式编译成功"
+          else
+            echo "::error::编译失败"
+            exit 1
+          fi
+
+          echo "::endgroup::"
