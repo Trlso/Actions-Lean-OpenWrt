@@ -32,6 +32,8 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+  DOWNLOAD_THREADS: 16
+  CCACHE_MAXSIZE: 5G
 
 permissions:
   contents: write
@@ -78,6 +80,16 @@ jobs:
           sudo -E apt-get -qq autoremove --purge -y
           sudo -E apt-get -qq clean
           sudo timedatectl set-timezone "$TZ"
+
+          # 创建 4GB swap 空间，防止编译时 OOM
+          echo "::group::创建 swap 空间"
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          echo "::endgroup::"
+
           sudo mkdir -p /workdir
           sudo chown "$(whoami)":"$(id -gn)" /workdir
 
@@ -103,6 +115,26 @@ jobs:
           fi
 
           ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+
+      # ==================== 缓存 ccache ====================
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ env.REPO_BRANCH }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.REPO_BRANCH }}-
+            ccache-
+
+      # ==================== 缓存 dl 下载目录 ====================
+      - name: Cache dl directory
+        uses: actions/cache@v5
+        with:
+          path: openwrt/dl
+          key: dl-${{ env.REPO_BRANCH }}-${{ hashFiles('.config') }}
+          restore-keys: |
+            dl-${{ env.REPO_BRANCH }}-
+            dl-
 
       # ==================== 加载自定义 Feeds ====================
       - name: Load custom feeds
@@ -162,10 +194,16 @@ jobs:
             exit 1
           fi
 
+          # 启用 ccache 加速重编译
+          cd openwrt
+          sed -i '/^# CONFIG_CCACHE is not set/d' .config
+          sed -i '/^CONFIG_CCACHE=/d' .config
+          echo "CONFIG_CCACHE=y" >> .config
+          echo "✅ 已启用 ccache"
+
           # 执行 DIY 第二阶段脚本
-          if [ -f "$DIY_P2_SH" ]; then
-            chmod +x "$DIY_P2_SH"
-            cd openwrt
+          if [ -f "$GITHUB_WORKSPACE/$DIY_P2_SH" ]; then
+            chmod +x "$GITHUB_WORKSPACE/$DIY_P2_SH"
             bash "$GITHUB_WORKSPACE/$DIY_P2_SH"
             echo "✅ 已执行 $DIY_P2_SH"
           else
@@ -182,8 +220,8 @@ jobs:
           make defconfig
           echo "::endgroup::"
 
-          echo "::group::下载软件包"
-          make download -j"$(nproc)"
+          echo "::group::下载软件包（${DOWNLOAD_THREADS} 线程）"
+          make download -j"$DOWNLOAD_THREADS"
           echo "::endgroup::"
 
           # 清理不完整下载
@@ -196,8 +234,15 @@ jobs:
           set -e
           cd openwrt
 
+          # 配置 ccache
+          export CCACHE_DIR="$PWD/.ccache"
+          export CCACHE_MAXSIZE="${CCACHE_MAXSIZE}"
+          mkdir -p "$CCACHE_DIR"
+          ccache -M "$CCACHE_MAXSIZE" 2>/dev/null || true
+          ccache -z 2>/dev/null || true
+
           NPROC=$(nproc)
-          echo "使用 ${NPROC} 线程编译"
+          echo "使用 ${NPROC} 线程编译，ccache 缓存目录: ${CCACHE_DIR}"
 
           echo "::group::编译开始"
           if make -j"$NPROC" 2>&1; then
@@ -210,6 +255,11 @@ jobs:
             echo "::error::编译失败"
             exit 1
           fi
+          echo "::endgroup::"
+
+          # 显示 ccache 统计
+          echo "::group::ccache 统计"
+          ccache -s 2>/dev/null || true
           echo "::endgroup::"
 
           echo "status=success" >> "$GITHUB_OUTPUT"
@@ -325,15 +375,34 @@ jobs:
           retain_days: 7
           keep_minimum_runs: 5
 
-      # ==================== 清理旧 Releases ====================
+      # ==================== 清理旧 Releases（使用 gh CLI） ====================
       - name: Remove old releases
         if: env.UPLOAD_RELEASE == 'true' && always()
-        uses: dev-drprasad/delete-older-releases@v1.0
-        with:
-          keep_latest: 3
-          delete_tags: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          KEEP=3
+
+          echo "::group::清理旧 Releases"
+          # 列出所有 Release，按创建时间升序排列
+          mapfile -t releases < <(gh release list --limit 100 --json tagName,createdAt -q '.[] | "\(.createdAt) \(.tagName)"' | sort)
+
+          TOTAL=${#releases[@]}
+          echo "当前共有 ${TOTAL} 个 Release，保留最新 ${KEEP} 个"
+
+          if [ "$TOTAL" -le "$KEEP" ]; then
+            echo "Release 数量未超过保留数，跳过清理"
+          else
+            # 删除除最新 KEEP 个之外的旧 Release（不删除 Git 标签）
+            for ((i=0; i<TOTAL-KEEP; i++)); do
+              tag=$(echo "${releases[$i]}" | awk '{print $2}')
+              [ -z "$tag" ] && continue
+              echo "删除 Release: $tag"
+              gh release delete "$tag" --yes 2>/dev/null || echo "⚠️ 删除失败: $tag"
+            done
+          fi
+          echo "::endgroup::"
 
       # ==================== 编译失败通知 ====================
       - name: Notification on failure
