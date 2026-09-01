@@ -1,10 +1,11 @@
 name: OpenWrt Builder
 
 on:
+  repository_dispatch:
   workflow_dispatch:
     inputs:
       upload_firmware:
-        description: 'Upload firmware artifacts'
+        description: '上传固件 Artifact'
         required: false
         default: 'true'
         type: choice
@@ -12,7 +13,7 @@ on:
           - 'true'
           - 'false'
       upload_release:
-        description: 'Upload to GitHub Release'
+        description: '上传到 GitHub Release'
         required: false
         default: 'true'
         type: choice
@@ -31,7 +32,6 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
-  CACHE_SIZE: 10G
 
 permissions:
   contents: write
@@ -43,10 +43,11 @@ jobs:
     timeout-minutes: 720
 
     steps:
+      # ==================== 检出仓库 ====================
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ==================== 环境初始化 ====================
+      # ==================== 初始化环境 ====================
       - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -85,6 +86,7 @@ jobs:
         working-directory: /workdir
         run: |
           set -e
+
           echo "::group::显示磁盘信息"
           df -hT "$PWD"
           echo "::endgroup::"
@@ -102,23 +104,28 @@ jobs:
 
           ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
 
-      # ==================== 自定义 Feeds ====================
+      # ==================== 加载自定义 Feeds ====================
       - name: Load custom feeds
         run: |
           set -e
+
           if [ -f "$FEEDS_CONF" ]; then
             cp -f "$FEEDS_CONF" openwrt/feeds.conf.default
+            echo "✅ 已加载 $FEEDS_CONF"
+          else
+            echo "未找到 $FEEDS_CONF，使用默认 feeds"
           fi
 
           if [ -f "$DIY_P1_SH" ]; then
             chmod +x "$DIY_P1_SH"
             cd openwrt
             bash "$GITHUB_WORKSPACE/$DIY_P1_SH"
+            echo "✅ 已执行 $DIY_P1_SH"
           else
             echo "未找到 $DIY_P1_SH，跳过"
           fi
 
-      # ==================== 更新 Feeds ====================
+      # ==================== 更新并安装 Feeds ====================
       - name: Update & install feeds
         run: |
           set -e
@@ -136,21 +143,31 @@ jobs:
       - name: Load custom configuration
         run: |
           set -e
+
+          # 复制自定义 files 目录（先删除再复制，避免嵌套）
           if [ -d files ]; then
+            rm -rf openwrt/files
             cp -rf files openwrt/files
+            echo "✅ 已复制 files 目录"
+          else
+            echo "未找到 files 目录，跳过"
           fi
 
+          # 加载 .config 配置文件
           if [ -f "$CONFIG_FILE" ]; then
             cp -f "$CONFIG_FILE" openwrt/.config
+            echo "✅ 已加载 $CONFIG_FILE"
           else
-            echo "⚠️ 未找到 $CONFIG_FILE"
+            echo "::error::未找到 $CONFIG_FILE，无法继续编译"
             exit 1
           fi
 
+          # 执行 DIY 第二阶段脚本
           if [ -f "$DIY_P2_SH" ]; then
             chmod +x "$DIY_P2_SH"
             cd openwrt
             bash "$GITHUB_WORKSPACE/$DIY_P2_SH"
+            echo "✅ 已执行 $DIY_P2_SH"
           else
             echo "未找到 $DIY_P2_SH，跳过"
           fi
@@ -181,8 +198,8 @@ jobs:
 
           NPROC=$(nproc)
           echo "使用 ${NPROC} 线程编译"
-          echo "::group::编译开始"
 
+          echo "::group::编译开始"
           if make -j"$NPROC" 2>&1; then
             echo "✅ 编译成功"
           elif make -j1 2>&1; then
@@ -193,5 +210,138 @@ jobs:
             echo "::error::编译失败"
             exit 1
           fi
-
           echo "::endgroup::"
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+          # 提取设备名
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
+            | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
+
+          if [ -s DEVICE_NAME ]; then
+            echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+          fi
+
+          echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      # ==================== 磁盘空间检查 ====================
+      - name: Check space usage
+        if: always()
+        run: |
+          echo "::group::磁盘空间使用"
+          df -hT
+          echo "::endgroup::"
+
+          echo "::group::编译产物大小"
+          du -sh openwrt/bin/targets/*/*/ 2>/dev/null || true
+          echo "::endgroup::"
+
+      # ==================== 上传完整 bin 目录 ====================
+      - name: Upload bin directory
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin
+          retention-days: 7
+          compression-level: 6
+
+      # ==================== 整理固件文件 ====================
+      - name: Organize firmware files
+        id: organize
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          set -e
+
+          FIRMWARE_DIR=$(find openwrt/bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
+
+          if [ -z "$FIRMWARE_DIR" ] || [ ! -d "$FIRMWARE_DIR" ]; then
+            echo "::error::未找到固件目录"
+            exit 1
+          fi
+
+          # 删除 packages 子目录，只保留固件
+          rm -rf "${FIRMWARE_DIR}"/packages
+
+          echo "FIRMWARE=$FIRMWARE_DIR" >> "$GITHUB_ENV"
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+          echo "::group::固件列表"
+          ls -lh "$FIRMWARE_DIR"
+          echo "::endgroup::"
+
+      # ==================== 上传固件 Artifact ====================
+      - name: Upload firmware artifact
+        if: steps.organize.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
+          retention-days: 30
+          compression-level: 6
+
+      # ==================== 生成 Release 标签 ====================
+      - name: Generate release tag
+        id: tag
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+        run: |
+          set -e
+
+          RELEASE_TAG="OpenWrt-$(date +%Y.%m.%d-%H%M)"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+          # 生成 Release 说明
+          cat > release.txt <<EOF
+          ## OpenWrt Lean 编译固件
+
+          **编译时间:** $(date '+%Y-%m-%d %H:%M:%S %Z')
+          **设备:** $(grep '^CONFIG_TARGET.*DEVICE.*=y' openwrt/.config | sed 's/.*DEVICE_\(.*\)=y/\1/' || echo 'Unknown')
+          **源码:** ${REPO_URL} @ ${REPO_BRANCH}
+
+          ---
+
+          > 本固件由 GitHub Actions 自动编译生成
+          EOF
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      # ==================== 上传到 GitHub Release ====================
+      - name: Upload to GitHub Release
+        if: steps.tag.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: ${{ env.FIRMWARE }}/*
+          make_latest: true
+
+      # ==================== 清理旧 Workflow 运行记录 ====================
+      - name: Delete old workflow runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 7
+          keep_minimum_runs: 5
+
+      # ==================== 清理旧 Releases ====================
+      - name: Remove old releases
+        if: env.UPLOAD_RELEASE == 'true' && always()
+        uses: dev-drprasad/delete-older-releases@v1.0
+        with:
+          keep_latest: 3
+          delete_tags: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ==================== 编译失败通知 ====================
+      - name: Notification on failure
+        if: failure()
+        run: |
+          echo "::error::OpenWrt 编译失败！"
+          echo "::error::请检查上方日志排查问题。"
+          echo "::error::常见原因："
+          echo "::error::  1. 配置文件选择的目标设备有误"
+          echo "::error::  2. 依赖包下载不完整"
+          echo "::error::  3. 源码更新导致配置不兼容"
