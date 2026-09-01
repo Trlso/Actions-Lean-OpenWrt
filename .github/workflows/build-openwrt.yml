@@ -75,7 +75,7 @@ jobs:
             git gperf haveged help2man intltool libc6-dev-i386 \
             libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
             libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
-            libpython3-dev libreadline-dev libssl-dev libtool lrzsz \
+            libpython3-dev libreadline-dev libssl-dev libtool libxml2-dev lrzsz \
             mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf \
             python3 python3-pyelftools python3-setuptools \
             qemu-utils rsync scons squashfs-tools subversion swig \
@@ -189,12 +189,36 @@ jobs:
           make defconfig
           echo "::endgroup::"
 
-          echo "::group::下载软件包"
+          echo "::group::下载软件包（多线程）"
           make download -j"$(nproc)"
           echo "::endgroup::"
 
-          # 清理不完整下载
+          echo "::group::校验并补全下载（单线程）"
+          # 单线程重跑，修复多线程导致的下载不完整 / sha256 校验失败
+          make download -j1 V=s 2>&1 | grep -viE "^Downloading|^$" || true
+          echo "::endgroup::"
+
+          # 清理不完整下载（小于 1KB 的文件）
           find dl -size -1024c -type f -delete 2>/dev/null || true
+
+          # 专项检查 gettext 源码包完整性
+          echo "::group::检查关键源码包"
+          for pkg in gettext-0.22.5; do
+            found=$(find dl -name "${pkg}.tar.*" -type f 2>/dev/null | head -1)
+            if [ -n "$found" ]; then
+              size=$(stat -c%s "$found" 2>/dev/null || echo 0)
+              echo "✅ ${pkg}: $(numfmt --to=iec ${size}) ($found)"
+              if [ "${size}" -lt 1000000 ]; then
+                echo "⚠️ ${pkg} 源码包疑似不完整，删除并重新下载..."
+                rm -f "$found"
+                make "package/libs/gettext-full/download" V=s || true
+              fi
+            else
+              echo "⚠️ ${pkg} 源码包未找到，尝试下载..."
+              make "package/libs/gettext-full/download" V=s || true
+            fi
+          done
+          echo "::endgroup::"
 
       # ==================== 编译固件 ====================
       - name: Compile firmware
@@ -232,7 +256,7 @@ jobs:
             echo "✅ 编译成功"
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::编译失败，请查看上方日志或下载 build.log 排查"
+            echo "::error::编译失败，请查看下方诊断日志或下载 build.log 排查"
             exit 1
           fi
 
@@ -245,6 +269,55 @@ jobs:
           fi
 
           echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      # ==================== 编译失败自动诊断 ====================
+      - name: Diagnose build failure
+        if: failure() && steps.compile.outcome == 'failure'
+        continue-on-error: true
+        working-directory: openwrt
+        run: |
+          echo "========================================"
+          echo "        编译失败自动诊断"
+          echo "========================================"
+
+          # 从 build.log 提取所有失败的包
+          echo "::group::失败包列表"
+          grep "ERROR:.*failed to build" build.log || echo "未找到明确的 ERROR 行"
+          echo "::endgroup::"
+
+          # 提取第一个失败的包，用 V=s 重新编译以获取详细错误
+          FAILED_LINE=$(grep "ERROR:.*failed to build" build.log | head -1)
+
+          if [ -n "$FAILED_LINE" ]; then
+            # 提取包路径，如 package/libs/gettext-full
+            PKG=$(echo "$FAILED_LINE" | sed 's/.*ERROR: \([^ ]*\).*/\1/')
+
+            # 判断是 host 编译还是普通编译
+            if echo "$FAILED_LINE" | grep -q "\[host\]"; then
+              TARGET="${PKG}/host/compile"
+            else
+              TARGET="${PKG}/compile"
+            fi
+
+            echo "📌 失败的包: $PKG"
+            echo "📌 重新编译: $TARGET (V=s)"
+            echo ""
+
+            echo "::group::详细编译日志 (V=s) - $TARGET"
+            # 用 V=s 重新编译失败包，显示最后 300 行
+            make "$TARGET" V=s 2>&1 | tail -300
+            echo "::endgroup::"
+
+            echo "::group::关键错误行"
+            # 提取常见错误关键词
+            make "$TARGET" V=s 2>&1 | grep -iE "error|failed|cannot|not found|no such|undefined|missing" | tail -50 || true
+            echo "::endgroup::"
+          else
+            echo "未找到明确的失败包，显示 build.log 最后 200 行："
+            echo "::group::build.log 最后 200 行"
+            tail -200 build.log
+            echo "::endgroup::"
+          fi
 
       # ==================== 上传编译日志（失败时） ====================
       - name: Upload build log on failure
@@ -319,13 +392,14 @@ jobs:
         run: |
           set -e
 
+          cd openwrt
           RELEASE_TAG="OpenWrt-$(date +%Y.%m.%d-%H%M)"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
           DEVICE=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
             | sed 's/.*DEVICE_\(.*\)=y/\1/' || echo 'Unknown')
 
-          cat > release.txt <<EOF
+          cat > "$GITHUB_WORKSPACE/release.txt" <<EOF
           ## OpenWrt Lean 编译固件
 
           **编译时间:** $(date '+%Y-%m-%d %H:%M:%S %Z')
@@ -385,9 +459,9 @@ jobs:
         if: failure()
         run: |
           echo "::error::OpenWrt 编译失败！"
-          echo "::error::请检查上方日志排查问题。"
+          echo "::error::请查看上方「Diagnose build failure」步骤的详细诊断日志"
           echo "::error::常见原因："
-          echo "::error::  1. 配置文件选择的目标设备有误"
-          echo "::error::  2. 依赖包下载不完整"
-          echo "::error::  3. 源码更新导致配置不兼容"
+          echo "::error::  1. gettext-full host-compile 失败 → 缺少 libxml2-dev（已修复，如仍失败请查看 V=s 日志）"
+          echo "::error::  2. 源码包下载不完整 → 已增加单线程校验补全"
+          echo "::error::  3. 补丁不兼容 → 查看 V=s 日志中的 patch 错误"
           echo "::error::完整编译日志已上传为 Artifact（build_log）"
