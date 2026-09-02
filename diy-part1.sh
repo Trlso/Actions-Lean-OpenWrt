@@ -7,3 +7,6 @@ sed -i '2i src-git fancontrol https://github.com/JiaY-shi/fancontrol' feeds.conf
 
 sed -i '3i src-git kenzo https://github.com/kenzok8/openwrt-packages' feeds.conf.default
 sed -i '4i src-git small https://github.com/kenzok8/small' feeds.conf.default
+
+# 清理过期的 feeds 缓存
+rm -rf feeds/packages/libs/gettext-full
