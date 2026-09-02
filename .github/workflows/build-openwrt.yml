@@ -1,3 +1,11 @@
+#=================================================
+# https://github.com/Lancenas/Actions-Lean-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+# Lisence: MIT
+# Author: P3TERX
+# Blog: https://P3TERX.com
+#=================================================
+
 name: OpenWrt Builder
 
 on:
@@ -8,7 +16,7 @@ env:
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
+  CONFIG_FILE: x86_64_mini.config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
   UPLOAD_BIN_DIR: false
