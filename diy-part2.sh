@@ -10,7 +10,7 @@ sed -i "s/hostname='LEDE'/hostname='H69K'/g" package/base-files/files/bin/config
 sed -i "/CYXluq4wUazHjmCDBCqXF/d" package/lean/default-settings/files/zzz-default-settings
 
 # AdGuardHome
-sed -i "s/aarch64|arm64)/aarch64|arm64|aarch64_generic)/g" feeds/kenzo/luci-app-adguardhome/root/usr/share/AdGuardHome/update_core.sh
+sed -i "s/aarch64|arm64)/aarch64|arm64|aarch64_generic)/g" feeds/smpackage/luci-app-adguardhome/root/usr/share/AdGuardHome/update_core.sh
 
 # Openlist
 sed -i "s/option enabled '0'/option enabled '1'/g" feeds/packages/net/openlist/files/openlist.config
