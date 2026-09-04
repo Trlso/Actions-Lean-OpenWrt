@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# 设置默认IP为 192.168.100.1
-sed -i 's/192.168.1.1/192.168.100.1/g' package/base-files/files/bin/config_generate
+# 设置默认IP为 192.168.1.1
+sed -i 's/192.168.1.1/192.168.1.1/g' package/base-files/files/bin/config_generate
 
 # 修改主机名
 sed -i "s/hostname='LEDE'/hostname='H69K'/g" package/base-files/files/bin/config_generate
