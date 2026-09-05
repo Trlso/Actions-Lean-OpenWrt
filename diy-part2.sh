@@ -22,3 +22,6 @@ sed -i "s/option log_enable '1'/option log_enable '0'/g" feeds/packages/net/open
 
 # OpenAppFilter
 sed -i "s/option disable_hnat '0'/option disable_hnat '1'/g" package/OpenAppFilter/open-app-filter/files/appfilter.config
+
+# Qmodem
+sed -i "s/option enable_pcie_scan '1'/option enable_usb_scan '1'/g" feeds/qmodem/application/qmodem/files/etc/config/qmodem
