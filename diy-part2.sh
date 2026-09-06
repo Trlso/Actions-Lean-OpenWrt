@@ -25,3 +25,5 @@ sed -i "s/option disable_hnat '0'/option disable_hnat '1'/g" package/OpenAppFilt
 
 # Qmodem
 sed -i "s/option enable_pcie_scan '1'/option enable_usb_scan '1'/g" feeds/qmodem/application/qmodem/files/etc/config/qmodem
+
+rm -rf feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
