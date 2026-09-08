@@ -11,7 +11,7 @@ sed -i "s/timezone='GMT0'/timezone='CST-8'/g" package/base-files/files/bin/confi
 sed -i "s/zonename='UTC'/zonename='Asia\/Shanghai'/g" package/base-files/files/bin/config_generate
 
 # 删除默认密码
-sed -i "/CYXluq4wUazHjmCDBCqXF/d" package/lean/default-settings/files/zzz-default-settings
+sed -i 's/root:::0:99999:7:::/root::0:99999:7:::/g' package/base-files/files/etc/shadow
 
 # AdGuardHome
 sed -i "s/aarch64|arm64)/aarch64|arm64|aarch64_generic)/g" feeds/smpackage/luci-app-adguardhome/root/usr/share/AdGuardHome/update_core.sh
